@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MetroVoice Podcast Automation System - CloudFormation Template'
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: 'metrovoice-podcast-automation'
+    Description: 'Name for the Lambda function'
+  
+  S3BucketName:
+    Type: String
+    Default: 'tmv-podcast-content'
+    Description: 'S3 bucket name for storing podcast content'
+  
+  SNSTopicName:
+    Type: String
+    Default: 'Upload_Podcast_Trigger'
+    Description: 'SNS topic name for podcast upload notifications'
+
+Resources:
+  # S3 Bucket for podcast content
+  PodcastContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldEpisodes
+            Status: Enabled
+            ExpirationInDays: 90
+            Prefix: episodes/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # SNS Topic for notifications
+  PodcastSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: 'MetroVoice Podcast Upload Trigger'
+
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LambdaFunctionName}-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PodcastAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${PodcastContentBucket}/*'
+                  - !Sub '${PodcastContentBucket}'
+              
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PodcastSNSTopic
+              
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*'
+
+  # Lambda function
+  PodcastAutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.9
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+      Timeout: 900  # 15 minutes
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          SNS_TOPIC_ARN: !Ref PodcastSNSTopic
+      ReservedConcurrencyLimit: 10
+
+  # CloudWatch Event Rule for daily scheduling
+  DailyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${LambdaFunctionName}-daily-schedule'
+      Description: 'Daily trigger for MetroVoice podcast automation'
+      ScheduleExpression: 'cron(0 6 * * ? *)'  # 6 AM UTC daily
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PodcastAutomationFunction.Arn
+          Id: DailyScheduleTarget
+
+  # CloudWatch Event Rule for weekly scheduling
+  WeeklyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${LambdaFunctionName}-weekly-schedule'
+      Description: 'Weekly trigger for MetroVoice podcast automation'
+      ScheduleExpression: 'cron(0 8 ? * MON *)'  # 8 AM UTC every Monday
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PodcastAutomationFunction.Arn
+          Id: WeeklyScheduleTarget
+
+  # Permission for CloudWatch Events to invoke Lambda
+  LambdaInvokePermissionDaily:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PodcastAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyScheduleRule.Arn
+
+  LambdaInvokePermissionWeekly:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PodcastAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyScheduleRule.Arn
+
+  # SNS Subscription (optional - for monitoring)
+  SNSEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PodcastSNSTopic
+      Protocol: email
+      Endpoint: !Ref 'AWS::NoValue'  # Replace with actual email in production
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt PodcastAutomationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  S3BucketName:
+    Description: 'Name of the S3 bucket for podcast content'
+    Value: !Ref PodcastContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic'
+    Value: !Ref PodcastSNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn' 
